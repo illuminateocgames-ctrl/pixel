@@ -81,12 +81,7 @@ engine.
      project.godot
    ```
 3. Open your project in Godot and go to *Project → Project Settings → Plugins* and **enable** "Pixel",
-   or paste this into `project.godot`:
-   ```ini
-   [editor_plugins]
 
-   enabled=PackedStringArray("res://addons/pixel/plugin.cfg")
-   ```
 4. A new **Pixel** button appears in the editor's top-right main-screen switcher (next to *Script*) with
    a rounded-square icon. Click it; the tab opens automatically when the project is opened.
 
