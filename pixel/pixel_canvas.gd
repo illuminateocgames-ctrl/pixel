@@ -9,6 +9,11 @@ signal color_picked(color: Color)
 signal history_changed(can_undo: bool, can_redo: bool)
 signal rollback_available_changed(available: bool)
 signal layers_changed(active_layer: int)
+signal animation_loaded(frame_count: int)
+signal frame_changed(index: int)
+signal frames_changed
+signal playback_changed(playing: bool)
+signal tool_changed(tool_name: String)
 
 const SUPPORTED_EXTENSIONS := ["png", "jpg", "jpeg"]
 const CHECKER_SIZE := 16.0
@@ -16,6 +21,7 @@ const MIN_ZOOM := 0.01
 const MAX_ZOOM := 256.0
 const MAX_HISTORY := 50
 const LAYER_COUNT := 4
+const DEFAULT_FRAME_DURATION_MS := 100
 
 var image: Image
 var layers: Array[Image] = []
@@ -50,6 +56,13 @@ var _redo_stack: Array[Dictionary] = []
 var _history_snapshot: Variant = null
 var _history_action_changed := false
 var _clipboard_image: Image
+var frames: Array[Dictionary] = []
+var active_frame_index := 0
+var is_playing := false
+var onion_skin_enabled := false
+var _play_accumulator := 0.0
+var _onion_prev_texture: ImageTexture
+var _onion_next_texture: ImageTexture
 
 
 func _ready() -> void:
@@ -60,6 +73,21 @@ func _ready() -> void:
 	clip_contents = true
 	mouse_default_cursor_shape = Control.CURSOR_CROSS
 	mouse_exited.connect(_on_mouse_exited)
+	set_process(false)
+
+
+func _process(delta: float) -> void:
+	if not is_playing or frames.is_empty():
+		return
+	_play_accumulator += delta * 1000.0
+	var guard := 0
+	while guard < frames.size():
+		var duration := get_frame_duration(active_frame_index)
+		if _play_accumulator < duration:
+			break
+		_play_accumulator -= duration
+		set_frame(wrapi(active_frame_index + 1, 0, frames.size()))
+		guard += 1
 
 
 func _notification(what: int) -> void:
@@ -72,6 +100,8 @@ func _notification(what: int) -> void:
 
 func set_tool(tool_name: String) -> void:
 	active_tool = tool_name
+	tool_changed.emit(tool_name)
+	queue_redraw()
 
 
 func set_draw_color(color: Color) -> void:
@@ -91,6 +121,162 @@ func get_source_path() -> String:
 	return source_path
 
 
+func get_frame_count() -> int:
+	return frames.size()
+
+
+func get_active_frame_index() -> int:
+	return active_frame_index
+
+
+func get_frame_duration(index: int) -> int:
+	if index < 0 or index >= frames.size():
+		return DEFAULT_FRAME_DURATION_MS
+	return maxi(1, int(frames[index].get("duration", DEFAULT_FRAME_DURATION_MS)))
+
+
+func set_frame_duration(index: int, duration_ms: int) -> void:
+	if index < 0 or index >= frames.size():
+		return
+	frames[index]["duration"] = clampi(duration_ms, 1, 60000)
+	frames_changed.emit()
+
+
+func set_frame(index: int) -> void:
+	if index < 0 or index >= frames.size() or index == active_frame_index:
+		return
+	_commit_history_action()
+	_commit_floating_selection()
+	_activate_frame(index)
+	frame_changed.emit(active_frame_index)
+
+
+func step_frame(offset: int) -> void:
+	if frames.is_empty():
+		return
+	set_frame(wrapi(active_frame_index + offset, 0, frames.size()))
+
+
+func toggle_playing() -> void:
+	set_playing(not is_playing)
+
+
+func set_playing(playing: bool) -> void:
+	if is_playing == playing:
+		return
+	is_playing = playing
+	_play_accumulator = 0.0
+	set_process(playing)
+	playback_changed.emit(is_playing)
+
+
+func set_onion_skin(enabled: bool) -> void:
+	if onion_skin_enabled == enabled:
+		return
+	onion_skin_enabled = enabled
+	_update_onion_textures()
+	queue_redraw()
+
+
+func add_empty_frame() -> void:
+	if frames.is_empty():
+		return
+	_commit_history_action()
+	_commit_floating_selection()
+	var frame_size := image.get_size()
+	var inserted_index := active_frame_index + 1
+	frames.insert(inserted_index, {
+		"layers": _blank_layers(frame_size),
+		"source_path": "",
+		"duration": get_frame_duration(active_frame_index),
+	})
+	_activate_frame(inserted_index)
+	_mark_image_dirty()
+	frames_changed.emit()
+	frame_changed.emit(active_frame_index)
+
+
+func duplicate_frame() -> void:
+	if frames.is_empty():
+		return
+	_commit_history_action()
+	_commit_floating_selection()
+	var layer_copies: Array[Image] = []
+	for layer in layers:
+		layer_copies.append(layer.duplicate())
+	var inserted_index := active_frame_index + 1
+	frames.insert(inserted_index, {
+		"layers": layer_copies,
+		"source_path": "",
+		"duration": get_frame_duration(active_frame_index),
+	})
+	_activate_frame(inserted_index)
+	_mark_image_dirty()
+	frames_changed.emit()
+	frame_changed.emit(active_frame_index)
+
+
+func can_delete_frame() -> bool:
+	return frames.size() > 1
+
+
+func delete_frame() -> void:
+	if not can_delete_frame():
+		return
+	_commit_history_action()
+	_commit_floating_selection()
+	frames.remove_at(active_frame_index)
+	var new_index := mini(active_frame_index, frames.size() - 1)
+	_activate_frame(new_index)
+	_mark_image_dirty()
+	frames_changed.emit()
+	frame_changed.emit(active_frame_index)
+
+
+func can_move_frame(offset: int) -> bool:
+	var target := active_frame_index + offset
+	return target >= 0 and target < frames.size()
+
+
+func move_frame(offset: int) -> void:
+	if not can_move_frame(offset):
+		return
+	move_frame_to(active_frame_index, active_frame_index + offset)
+
+
+func move_frame_to(from_index: int, to_index: int) -> void:
+	if frames.is_empty():
+		return
+	var clamped_from := clampi(from_index, 0, frames.size() - 1)
+	var clamped_to := clampi(to_index, 0, frames.size())
+	if clamped_from == clamped_to or clamped_from + 1 == clamped_to:
+		return
+	_commit_history_action()
+	_commit_floating_selection()
+
+	var insert_index := clamped_to if clamped_to <= clamped_from else clamped_to - 1
+	var moved_frame: Dictionary = frames[clamped_from]
+	frames.remove_at(clamped_from)
+	frames.insert(insert_index, moved_frame)
+
+	var new_active := active_frame_index
+	if active_frame_index == clamped_from:
+		new_active = insert_index
+	else:
+		var shifted_active := active_frame_index if active_frame_index < clamped_from else active_frame_index - 1
+		new_active = shifted_active if shifted_active < insert_index else shifted_active + 1
+
+	_activate_frame(new_active)
+	frames_changed.emit()
+	frame_changed.emit(active_frame_index)
+
+
+func get_frame_composite(index: int) -> Image:
+	if index < 0 or index >= frames.size():
+		return null
+	return _compose_frame(frames[index])
+
+
 func _can_drop_data(_at_position: Vector2, data: Variant) -> bool:
 	for path in _get_dropped_paths(data):
 		if _is_supported_sprite(path):
@@ -99,10 +285,16 @@ func _can_drop_data(_at_position: Vector2, data: Variant) -> bool:
 
 
 func _drop_data(_at_position: Vector2, data: Variant) -> void:
+	var sprite_paths: Array[String] = []
 	for path in _get_dropped_paths(data):
 		if _is_supported_sprite(path):
-			_load_sprite(path)
-			return
+			sprite_paths.append(path)
+	if sprite_paths.is_empty():
+		return
+	if sprite_paths.size() == 1:
+		_load_sprite(sprite_paths[0])
+	else:
+		load_animation(sprite_paths)
 
 
 func _get_dropped_paths(data: Variant) -> Array[String]:
@@ -131,30 +323,81 @@ func _is_supported_sprite(path: String) -> bool:
 
 
 func _load_sprite(path: String) -> int:
+	var loaded_image := _load_image_file(path)
+	if loaded_image == null:
+		return ERR_FILE_CORRUPT
+	_set_animation([_make_frame(loaded_image, path)])
+	return OK
+
+
+func load_animation(paths: Array[String]) -> int:
+	var images: Array[Image] = []
+	var frame_paths: Array[String] = []
+	var canvas_size := Vector2i.ZERO
+	for path in paths:
+		if not _is_supported_sprite(path):
+			continue
+		var loaded_image := _load_image_file(path)
+		if loaded_image == null:
+			continue
+		if images.is_empty():
+			canvas_size = loaded_image.get_size()
+		elif loaded_image.get_size() != canvas_size:
+			push_warning("Pixel: Skipped %s (size differs from the first frame)" % path)
+			continue
+		images.append(loaded_image)
+		frame_paths.append(path)
+
+	if images.is_empty():
+		return ERR_FILE_CORRUPT
+
+	var new_frames: Array[Dictionary] = []
+	for index in range(images.size()):
+		new_frames.append(_make_frame(images[index], frame_paths[index]))
+	_set_animation(new_frames)
+	return OK
+
+
+func _load_image_file(path: String) -> Image:
 	var loaded_image := Image.new()
 	var error := loaded_image.load(path)
 	if error != OK or loaded_image.is_empty():
-		push_warning("Pixel Art: Could not load sprite: %s" % path)
-		return error if error != OK else ERR_FILE_CORRUPT
+		push_warning("Pixel: Could not load sprite: %s" % path)
+		return null
 	if loaded_image.get_format() != Image.FORMAT_RGBA8:
 		loaded_image.convert(Image.FORMAT_RGBA8)
+	return loaded_image
 
-	layers.clear()
-	layers.append(loaded_image)
-	for _index in range(1, LAYER_COUNT):
-		var blank_layer := Image.create(loaded_image.get_width(), loaded_image.get_height(), false, Image.FORMAT_RGBA8)
+
+func _blank_layers(layer_size: Vector2i) -> Array[Image]:
+	var new_layers: Array[Image] = []
+	for _index in range(LAYER_COUNT):
+		var blank_layer := Image.create(layer_size.x, layer_size.y, false, Image.FORMAT_RGBA8)
 		blank_layer.fill(Color.TRANSPARENT)
-		layers.append(blank_layer)
-	_selection_layer = Image.create(loaded_image.get_width(), loaded_image.get_height(), false, Image.FORMAT_RGBA8)
-	_selection_layer.fill(Color.TRANSPARENT)
-	_selection_layer_active = false
+		new_layers.append(blank_layer)
+	return new_layers
+
+
+func _make_frame(base_image: Image, path: String) -> Dictionary:
+	var frame_layers := _blank_layers(base_image.get_size())
+	frame_layers[0] = base_image
+	return {
+		"layers": frame_layers,
+		"source_path": path,
+		"duration": DEFAULT_FRAME_DURATION_MS,
+	}
+
+
+func _set_animation(new_frames: Array[Dictionary]) -> void:
+	set_playing(false)
+	_commit_history_action()
+	frames = new_frames
+	active_frame_index = 0
 	active_layer_index = 0
-	image = layers[active_layer_index]
-	source_path = path
-	_is_dirty = false
 	_selection = Rect2i()
 	_selection_active = false
 	_selection_dragging = false
+	_selection_layer_active = false
 	_gesture_active = false
 	_moving_selection = false
 	_is_panning = false
@@ -162,39 +405,104 @@ func _load_sprite(path: String) -> int:
 	_redo_stack.clear()
 	_history_snapshot = null
 	_history_action_changed = false
+	_is_dirty = false
 	_pan_offset = Vector2.ZERO
 	_fit_to_view_on_resize = true
+	_activate_frame(0)
 	_fit_image_to_view()
 	_refresh_texture()
 	sprite_loaded.emit(source_path, image.get_width(), image.get_height())
 	zoom_changed.emit(zoom)
 	_emit_history_changed()
 	rollback_available_changed.emit(has_rollback())
-	layers_changed.emit(active_layer_index)
-	return OK
+	animation_loaded.emit(frames.size())
+	frame_changed.emit(active_frame_index)
+	frames_changed.emit()
+
+
+func _activate_frame(index: int) -> void:
+	active_frame_index = index
+	var frame: Dictionary = frames[index]
+	layers = frame["layers"]
+	image = layers[active_layer_index]
+	source_path = frame["source_path"]
+	if _selection_layer == null or _selection_layer.get_size() != image.get_size():
+		_selection_layer = Image.create(image.get_width(), image.get_height(), false, Image.FORMAT_RGBA8)
+		_selection_layer.fill(Color.TRANSPARENT)
+		_selection_layer_active = false
+	_refresh_texture()
+	_update_onion_textures()
 
 
 func save_sprite() -> int:
-	if image == null or source_path.is_empty():
+	if frames.is_empty():
 		return ERR_UNCONFIGURED
-	var backup_error := _save_rollback_copy()
-	if backup_error != OK:
-		return backup_error
 
-	var extension := source_path.get_extension().to_lower()
-	var error: int
-	var composite := _compose_layers()
-	if extension == "png":
-		error = composite.save_png(source_path)
-	elif extension == "jpg" or extension == "jpeg":
-		error = composite.save_jpg(source_path, 1.0)
-	else:
-		return ERR_UNAVAILABLE
+	for index in range(frames.size()):
+		var frame: Dictionary = frames[index]
+		var path: String = frame["source_path"]
+		if path.is_empty():
+			path = _generate_frame_path()
+			if path.is_empty():
+				return ERR_FILE_NOT_FOUND
+			frame["source_path"] = path
+		if FileAccess.file_exists(path):
+			var backup_error := _save_rollback_copy(path)
+			if backup_error != OK:
+				return backup_error
 
-	if error == OK:
-		_is_dirty = false
-		sprite_saved.emit()
-	return error
+		var composite := _compose_frame(frame)
+		var extension := path.get_extension().to_lower()
+		var error: int
+		if extension == "png":
+			error = composite.save_png(path)
+		elif extension == "jpg" or extension == "jpeg":
+			error = composite.save_jpg(path, 1.0)
+		else:
+			return ERR_UNAVAILABLE
+		if error != OK:
+			return error
+
+	source_path = frames[active_frame_index]["source_path"]
+	_is_dirty = false
+	sprite_saved.emit()
+	return OK
+
+
+func _compose_frame(frame: Dictionary) -> Image:
+	var frame_layers: Array[Image] = frame["layers"]
+	var layer_size := frame_layers[0].get_size()
+	var composite := Image.create(layer_size.x, layer_size.y, false, Image.FORMAT_RGBA8)
+	composite.fill(Color.TRANSPARENT)
+	var source_rect := Rect2i(Vector2i.ZERO, layer_size)
+	for layer in frame_layers:
+		composite.blend_rect(layer, source_rect, Vector2i.ZERO)
+	return composite
+
+
+func _generate_frame_path() -> String:
+	var base_path := ""
+	for frame in frames:
+		if not String(frame["source_path"]).is_empty():
+			base_path = frame["source_path"]
+			break
+	if base_path.is_empty():
+		return ""
+
+	var directory := base_path.get_base_dir()
+	var extension := base_path.get_extension().to_lower()
+	var stem := base_path.get_basename().get_file()
+	var stem_parts := stem.split("_", false)
+	if stem_parts.size() >= 2 and stem_parts[stem_parts.size() - 1].is_valid_int():
+		stem = "_".join(stem_parts.slice(0, stem_parts.size() - 1))
+
+	var number := 1
+	while number <= 10000:
+		var candidate := "%s_%03d.%s" % [stem, number, extension]
+		if not FileAccess.file_exists(directory.path_join(candidate)):
+			return directory.path_join(candidate)
+		number += 1
+	return ""
 
 
 func has_rollback() -> bool:
@@ -207,17 +515,18 @@ func rollback_sprite() -> int:
 	var error := _copy_file(_get_rollback_path(source_path), source_path)
 	if error != OK:
 		return error
-	return _load_sprite(source_path)
+	return discard_edits()
 
 
-func _save_rollback_copy() -> int:
-	if not FileAccess.file_exists(source_path):
+func _save_rollback_copy(path: String) -> int:
+	if not FileAccess.file_exists(path):
 		return ERR_FILE_NOT_FOUND
-	var backup_path := _get_rollback_path(source_path)
+	var backup_path := _get_rollback_path(path)
 	var backup_directory := ProjectSettings.globalize_path(backup_path.get_base_dir())
 	var directory_error := DirAccess.make_dir_recursive_absolute(backup_directory)
 	if directory_error != OK and not DirAccess.dir_exists_absolute(backup_directory):
 		return directory_error
+	_ensure_rollback_gdignore()
 
 	var absolute_backup_path := ProjectSettings.globalize_path(backup_path)
 	if FileAccess.file_exists(backup_path):
@@ -225,7 +534,7 @@ func _save_rollback_copy() -> int:
 		if remove_error != OK:
 			return remove_error
 
-	var copy_error := _copy_file(source_path, backup_path)
+	var copy_error := _copy_file(path, backup_path)
 	if copy_error == OK:
 		rollback_available_changed.emit(true)
 	return copy_error
@@ -273,10 +582,51 @@ func _get_rollback_path(path: String) -> String:
 	return "res://addons/pixel/rollback".path_join(relative_path)
 
 
+func _ensure_rollback_gdignore() -> void:
+	var gdignore_path := "res://addons/pixel/rollback/.gdignore"
+	if FileAccess.file_exists(gdignore_path):
+		return
+	var writer := FileAccess.open(gdignore_path, FileAccess.WRITE)
+	if writer != null:
+		writer.close()
+
+
 func discard_edits() -> int:
-	if source_path.is_empty():
+	set_playing(false)
+	if frames.is_empty():
 		return ERR_UNCONFIGURED
-	return _load_sprite(source_path)
+
+	var reloaded := 0
+	var has_unsaved_frames := false
+	for index in range(frames.size()):
+		var path := String(frames[index]["source_path"])
+		if path.is_empty():
+			continue
+		var loaded_image := _load_image_file(path)
+		if loaded_image == null:
+			continue
+		frames[index]["layers"][0] = loaded_image
+		reloaded += 1
+
+	if reloaded == 0:
+		return ERR_UNCONFIGURED
+	has_unsaved_frames = false
+	for index in range(frames.size()):
+		has_unsaved_frames = has_unsaved_frames or String(frames[index]["source_path"]).is_empty()
+
+	layers = frames[active_frame_index]["layers"]
+	image = layers[active_layer_index]
+	source_path = frames[active_frame_index]["source_path"]
+	_selection_layer_active = false
+	_selection = Rect2i()
+	_selection_active = false
+	_is_dirty = has_unsaved_frames
+	_refresh_texture()
+	_update_onion_textures()
+	if not has_unsaved_frames:
+		sprite_saved.emit()
+	frames_changed.emit()
+	return OK
 
 
 func _gui_input(event: InputEvent) -> void:
@@ -287,6 +637,50 @@ func _gui_input(event: InputEvent) -> void:
 		elif event.keycode == KEY_V:
 			_paste_selection()
 			accept_event()
+	elif event is InputEventKey and event.pressed and not event.echo:
+		match event.keycode:
+			KEY_Z:
+				undo()
+				accept_event()
+			KEY_U:
+				redo()
+				accept_event()
+			KEY_B:
+				set_tool("draw")
+				accept_event()
+			KEY_E:
+				set_tool("erase")
+				accept_event()
+			KEY_M:
+				set_tool("select")
+				accept_event()
+			KEY_F:
+				set_tool("fill")
+				accept_event()
+			KEY_I:
+				set_tool("eyedropper")
+				accept_event()
+			KEY_O, KEY_P:
+				set_tool("circle")
+				accept_event()
+			KEY_K:
+				set_tool("line")
+				accept_event()
+			KEY_D:
+				duplicate_frame()
+				accept_event()
+			KEY_N:
+				add_empty_frame()
+				accept_event()
+			KEY_COMMA, KEY_LEFT:
+				step_frame(-1)
+				accept_event()
+			KEY_PERIOD, KEY_RIGHT:
+				step_frame(1)
+				accept_event()
+			KEY_SPACE:
+				toggle_playing()
+				accept_event()
 	elif event is InputEventPanGesture:
 		_fit_to_view_on_resize = false
 		_pan_offset += event.delta
@@ -722,6 +1116,7 @@ func _snapshot_layer_state() -> Dictionary:
 	for layer in layers:
 		layer_copies.append(layer.duplicate())
 	return {
+		"frame": active_frame_index,
 		"layers": layer_copies,
 		"active_layer": active_layer_index,
 		"selection_layer": _selection_layer.duplicate() if _selection_layer != null else null,
@@ -732,17 +1127,27 @@ func _snapshot_layer_state() -> Dictionary:
 
 
 func _restore_layer_state(state: Dictionary) -> void:
-	layers.clear()
-	for saved_layer in state["layers"]:
-		layers.append(saved_layer)
-	active_layer_index = state["active_layer"]
-	_selection_layer = state["selection_layer"]
-	_selection_layer_active = state["selection_layer_active"]
-	_selection = state["selection"]
-	_selection_active = state["selection_active"]
-	image = _selection_layer if _selection_layer_active else layers[active_layer_index]
-	_refresh_texture()
-	layers_changed.emit(active_layer_index)
+	var frame_index: int = state["frame"]
+	var frame: Dictionary = frames[frame_index]
+	var restored_layers: Array[Image] = state["layers"]
+	frame["layers"] = restored_layers
+
+	if frame_index != active_frame_index:
+		_selection_layer_active = false
+		_selection = Rect2i()
+		_selection_active = false
+		_activate_frame(frame_index)
+		frame_changed.emit(frame_index)
+	else:
+		layers = restored_layers
+		active_layer_index = state["active_layer"]
+		_selection_layer = state["selection_layer"]
+		_selection_layer_active = state["selection_layer_active"]
+		_selection = state["selection"]
+		_selection_active = state["selection_active"]
+		image = _selection_layer if _selection_layer_active else layers[active_layer_index]
+		_refresh_texture()
+	_update_onion_textures()
 
 
 func _emit_history_changed() -> void:
@@ -833,6 +1238,17 @@ func _refresh_texture() -> void:
 	queue_redraw()
 
 
+func _update_onion_textures() -> void:
+	_onion_prev_texture = null
+	_onion_next_texture = null
+	if not onion_skin_enabled or frames.size() < 2:
+		return
+	if active_frame_index > 0:
+		_onion_prev_texture = ImageTexture.create_from_image(_compose_frame(frames[active_frame_index - 1]))
+	if active_frame_index < frames.size() - 1:
+		_onion_next_texture = ImageTexture.create_from_image(_compose_frame(frames[active_frame_index + 1]))
+
+
 func _compose_layers(
 	override_index: int = -1,
 	override_image: Image = null,
@@ -857,7 +1273,7 @@ func _compose_layers(
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, size), Color("#202124"))
 	if image == null:
-		var message := "Drop a PNG or JPEG sprite here"
+		var message := "Drop one or more PNG/JPEG sprites — several files become an animation"
 		draw_string(
 			ThemeDB.fallback_font,
 			Vector2(16.0, size.y * 0.5),
@@ -884,6 +1300,12 @@ func _draw() -> void:
 					Vector2(CHECKER_SIZE, CHECKER_SIZE)
 				)
 				draw_rect(tile.intersection(visible_rect), shade)
+
+	if onion_skin_enabled and not is_playing and frames.size() > 1:
+		if _onion_prev_texture:
+			draw_texture_rect(_onion_prev_texture, rect, false, Color(1.0, 0.35, 0.35, 0.35))
+		if _onion_next_texture:
+			draw_texture_rect(_onion_next_texture, rect, false, Color(0.35, 0.55, 1.0, 0.35))
 
 	var displayed_texture := _move_base_texture if _moving_selection else _texture
 	if displayed_texture:
