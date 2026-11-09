@@ -8,13 +8,9 @@ engine.
 
 ## Features
 
-- **Pixel tab in the editor** with an always-visible dark canvas, left tool sidebar, top action bar and a
-  bottom animation timeline.
-- **Sprites are edited at their real size** — a 32×32 image is 32×32 pixels on screen. Newly loaded frames
-  are zoomed to fill 75% of the canvas.
+
 - **Drag-and-drop sprites** from Godot's FileSystem dock (or from your OS) onto the canvas.
-- **Animation workflow** — drop *several* images at once (same size) and they become an animation,
-  Aseprite-style:
+- **Animation workflow** — drop *several* images at once (same size) and they become an animation
   - Frame strip with thumbnails, click to switch frames.
   - Drag-and-drop reordering of frames.
   - Per-frame duration in ms (with live FPS display).
@@ -30,8 +26,7 @@ engine.
 - **Non-destructive save flow**: edits live in memory until you press **Redraw**, which writes every frame
   back to its source file. Before writing, Redraw stores the previous file in
   `addons/pixel/rollback/` (mirroring the project path), letting you press **Rollback** to restore the
-  pre-redraw image. Rollback files are hidden from the editor with a `.gdignore` so they can't be
-  accidentally imported or moved around.
+  pre-redraw image.
 - **Undo / Redo** frame-aware snapshot history (buttons or keyboard).
 - The **Rollback** button reverts the currently displayed frame's file to its pre-redraw backup.
 
